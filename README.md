@@ -1,0 +1,187 @@
+# SCADA Grid-Telemetry Demo with Flink CEP
+
+End-to-end streaming pipeline: simulated electrical-distribution components (PLCs/RTUs) → Kafka → Apache Flink (CEP pattern matching + windowed aggregates) → Kafka → Spring Boot API → Postgres + SSE.
+
+## Quick Start
+
+```bash
+cd scada && docker compose up --build -d
+```
+
+Wait for all services to be healthy (~60s), then:
+
+```bash
+# SSE stream (live aggregates + CEP alerts)
+curl -N http://localhost:8096/api/stream
+
+# REST queries
+curl -s http://localhost:8096/api/components | jq
+curl -s http://localhost:8096/api/aggregates | jq
+curl -s http://localhost:8096/api/alerts | jq
+curl -s "http://localhost:8096/api/aggregates?componentId=SUB-A-FDR-1&limit=5" | jq
+curl -s "http://localhost:8096/api/alerts?componentId=SUB-A-BKR-1&limit=5" | jq
+
+# Direct Kafka verification
+docker exec scada-kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic scada.alerts \
+  --from-beginning
+```
+
+## Architecture
+
+```
+scada-simulator ──▶ Kafka(scada.telemetry) ──▶ Flink job ──▶ Kafka(scada.aggregates)
+                                                       ├──▶ CEP ──▶ Kafka(scada.alerts)
+                                                                          │
+                             Spring Boot ◀── consumes both ───────────────┘
+                             │        │
+                       Postgres    SSE stream + REST
+```
+
+## Grid Topology
+
+Two substations, 10 components total:
+
+| Substation | Nominal Voltage | Components |
+|---|---|---|
+| SUB-A | 34.5 kV | XFMR-1, FDR-1, BKR-1, FDR-2, BKR-2 |
+| SUB-B | 13.8 kV | XFMR-1, FDR-1, BKR-1, FDR-2, BKR-2 |
+
+Each feeder rated 400 A. Feeders paired with breakers.
+
+## Event Schema — `scada.telemetry`
+
+| Field | Type | Applies To |
+|---|---|---|
+| componentId | String | all |
+| componentType | FEEDER \| TRANSFORMER \| BREAKER | all |
+| substationId | String | all |
+| voltage | Double (kV) | all |
+| current | Double (A) | all |
+| frequency | Double (Hz) | all |
+| breakerStatus | OPEN \| CLOSED | BREAKER only |
+| oilTemp | Double (C) | TRANSFORMER only |
+| tapPosition | Integer | TRANSFORMER only |
+| timestamp | Instant (ISO-8601) | all |
+
+Non-applicable fields are `null`.
+
+## Fault Scenarios → CEP Patterns
+
+The simulator injects one of four fault scenarios every 45–90 seconds. Flink CEP detects each with a corresponding pattern:
+
+| Scenario | Description | CEP Alert | Keyed By |
+|---|---|---|---|
+| SAG_THEN_TRIP | Feeder voltage drops to 0.80–0.88 pu for 4–6 readings, then paired breaker opens; recloses ~10 s later | `VOLTAGE_SAG_BREAKER_TRIP` | substationId |
+| TRANSFORMER_OVERHEAT | Oil temp ramps +2.5 C/reading for ~20 readings (crosses 90 then 105 C), then cools | `TRANSFORMER_OVERHEAT` | componentId |
+| BREAKER_FLAPPING | OPEN/CLOSED toggles every 2–3 readings, 5–6 toggles in ~25 s | `BREAKER_FLAPPING` | componentId |
+| OVERCURRENT_BURST | Feeder current 1.3–1.6× rated for 6–8 consecutive readings | `SUSTAINED_OVERCURRENT` | componentId |
+
+CEP patterns use `AfterMatchSkipStrategy.skipPastLastEvent()` per pattern and relaxed contiguity where interleaved events from other components are tolerated.
+
+### CEP Pattern Details
+
+1. **VOLTAGE_SAG_BREAKER_TRIP** — keyed by `substationId` (cross-component correlation)
+   - `sag`: FEEDER with `voltage < 0.90 × nominal`, at least 3 occurrences
+   - `followedBy` `trip`: BREAKER with status `OPEN`
+   - `within(30s)`
+
+2. **TRANSFORMER_OVERHEAT** — keyed by `componentId`
+   - `warming`: TRANSFORMER with `90 < oilTemp <= 105` (upper bound prevents re-matching during cool-down)
+   - `followedBy` `critical`: TRANSFORMER with `oilTemp > 105`
+   - `within(90s)`
+
+3. **BREAKER_FLAPPING** — keyed by `componentId`
+   - OPEN → CLOSED → OPEN → CLOSED (relaxed contiguity — repeated same-status readings between toggles are skipped)
+   - `within(30s)`
+
+4. **SUSTAINED_OVERCURRENT** — keyed by `componentId`
+   - FEEDER with `current > 1.2 × 400A` (480 A), 5 consecutive readings
+   - `within(20s)`
+
+## Infrastructure Fault Scenarios (Flink Fault Tolerance)
+
+Beyond the simulated *grid* faults above, the stack is configured to demonstrate Flink's own fault tolerance:
+
+- **Checkpointing**: every 10 s, exactly-once mode, stored on a shared volume (`file:///opt/flink/checkpoints`).
+- **Restart strategy**: exponential-delay (1 s initial, 30 s max backoff).
+- **Two TaskManagers**: the job runs on one; the other is standby capacity for instant failover.
+- **Exactly-once end-to-end**: transactional Kafka sinks + `read_committed` Spring consumer. Results become visible when a checkpoint completes, so aggregates/alerts trail by up to ~10 s.
+
+Inject faults with the harness (each prints before/after evidence — job state, checkpoint restore id, TaskManager registrations, downstream row counts):
+
+```bash
+./fault-scenarios.sh status              # baseline health
+./fault-scenarios.sh kill-taskmanager    # SIGKILL a TM → failover to standby, state restored from checkpoint
+./fault-scenarios.sh kafka-outage        # broker down 30s → restart strategy rides it out
+./fault-scenarios.sh restart-jobmanager  # no HA: job resubmits fresh, resumes from committed offsets
+./fault-scenarios.sh network-partition   # TM unreachable → heartbeat-timeout detection, then failover
+```
+
+| Scenario | What it demonstrates |
+|---|---|
+| `kill-taskmanager` | Checkpoint-based recovery: tasks redeploy to the standby TaskManager and restore window + CEP state from the last checkpoint (see "LATEST RESTORE" in output / Flink UI). No duplicates downstream thanks to exactly-once sinks. |
+| `kafka-outage` | Connector-level resilience: for a short outage the Kafka clients buffer and retry (producer `delivery.timeout.ms` = 2 min), so tasks typically ride it out without restarting — checkpoints stall, then resume. Longer outages fail the tasks and engage the exponential-delay restart strategy. (Simulator uses `acks=0`, so telemetry produced during the outage is dropped at the producer — not a Flink loss.) |
+| `restart-jobmanager` | The limitation HA solves: without ZooKeeper/K8s HA, checkpoint metadata is lost and the job restarts fresh — but the Kafka source falls back to offsets committed at the last checkpoint, so it resumes rather than skips ahead. |
+| `network-partition` | Failure *detection*: the TaskManager is alive but unreachable; the JobManager notices via heartbeat timeout (~50 s) before the same checkpoint-restore failover as a kill. |
+
+## Services & Ports
+
+| Service | Port | Description |
+|---|---|---|
+| Flink Web UI | 8095 | Job dashboard, CEP operators visible |
+| Spring API | 8096 | REST + SSE endpoints |
+| Kafka | 29192 (host) | Message broker (internal: 9092) |
+| Postgres | 5475 (host) | Persistence |
+
+## Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/components` | Distinct component IDs with data |
+| GET | `/api/aggregates?componentId=&limit=` | Recent 30 s window aggregates |
+| GET | `/api/alerts?componentId=&limit=` | Recent CEP alerts |
+| GET | `/api/stream` | SSE (text/event-stream) |
+
+### Aggregate Fields
+
+`componentId`, `readingCount`, `avgVoltage`, `minVoltage`, `maxVoltage`, `avgCurrent`, `maxOilTemp` (nullable), `windowStart`, `windowEnd`
+
+### Alert Fields
+
+`componentId`, `substationId`, `alertType`, `message`, `timestamp`
+
+## Running Alongside Baseline
+
+The SCADA stack uses isolated ports (8095/8096, 29192, 5475) and container names (`scada-*`). The baseline IoT stack can run simultaneously from `../iot-poc` with no conflicts.
+
+## Verification
+
+1. Check simulator logs for scenario lifecycle:
+   ```bash
+   docker logs -f scada-simulator
+   # "scenario started: SAG_THEN_TRIP feeder=SUB-A-FDR-1 breaker=SUB-A-BKR-1"
+   # "scenario ended: SAG_THEN_TRIP"
+   ```
+
+2. Watch Kafka alerts (should appear within ~1–2 min):
+   ```bash
+   docker exec scada-kafka /opt/kafka/bin/kafka-console-consumer.sh \
+     --bootstrap-server localhost:9092 \
+     --topic scada.alerts
+   ```
+
+3. Check Flink UI at http://localhost:8095 — running job with 4 CEP operators plus aggregate window.
+
+All 4 alert types should appear over a few minutes (scenario fires every 45–90 s).
+
+## Build Order
+
+```bash
+# Compile Flink job first (fail-fast before Docker build)
+mvn -f scada/flink-job/pom.xml package -DskipTests -q
+
+# Then bring up the stack
+docker compose -f scada/docker-compose.yml up --build -d
+```

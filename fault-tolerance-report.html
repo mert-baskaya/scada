@@ -1,0 +1,559 @@
+<title>SCADA × Flink — Pipeline & Fault Tolerance</title>
+<style>
+  :root {
+    --page: #f7f7f5;
+    --surface: #fcfcfb;
+    --ink: #0b0b0b;
+    --ink-2: #52514e;
+    --muted: #898781;
+    --grid: #e1e0d9;
+    --baseline: #c3c2b7;
+    --border: rgba(11,11,11,.10);
+    --accent: #2a78d6;
+    --accent-soft: rgba(42,120,214,.10);
+    --aqua: #1baf7a;
+    --seq-a: #86b6ef;
+    --seq-b: #2a78d6;
+    --seq-c: #184f95;
+    --good: #0ca30c;
+    --good-text: #006300;
+    --warning: #fab219;
+    --serious: #ec835a;
+    --critical: #d03b3b;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --page: #0d0d0d;
+      --surface: #1a1a19;
+      --ink: #ffffff;
+      --ink-2: #c3c2b7;
+      --muted: #898781;
+      --grid: #2c2c2a;
+      --baseline: #383835;
+      --border: rgba(255,255,255,.10);
+      --accent: #3987e5;
+      --accent-soft: rgba(57,135,229,.16);
+      --aqua: #199e70;
+      --seq-a: #86b6ef;
+      --seq-b: #3987e5;
+      --seq-c: #1c5cab;
+      --good-text: #0ca30c;
+    }
+  }
+  :root[data-theme="dark"] {
+    --page: #0d0d0d;
+    --surface: #1a1a19;
+    --ink: #ffffff;
+    --ink-2: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --baseline: #383835;
+    --border: rgba(255,255,255,.10);
+    --accent: #3987e5;
+    --accent-soft: rgba(57,135,229,.16);
+    --aqua: #199e70;
+    --seq-a: #86b6ef;
+    --seq-b: #3987e5;
+    --seq-c: #1c5cab;
+    --good-text: #0ca30c;
+  }
+  :root[data-theme="light"] {
+    --page: #f7f7f5;
+    --surface: #fcfcfb;
+    --ink: #0b0b0b;
+    --ink-2: #52514e;
+    --muted: #898781;
+    --grid: #e1e0d9;
+    --baseline: #c3c2b7;
+    --border: rgba(11,11,11,.10);
+    --accent: #2a78d6;
+    --accent-soft: rgba(42,120,214,.10);
+    --aqua: #1baf7a;
+    --seq-a: #86b6ef;
+    --seq-b: #2a78d6;
+    --seq-c: #184f95;
+    --good-text: #006300;
+  }
+
+  body {
+    background: var(--page);
+    color: var(--ink);
+    font-family: var(--sans);
+    line-height: 1.55;
+    margin: 0;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 40px 24px 80px; }
+
+  header.masthead { margin-bottom: 40px; }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 10px;
+  }
+  h1 {
+    font-size: clamp(26px, 4vw, 36px);
+    font-weight: 700;
+    letter-spacing: -.02em;
+    line-height: 1.15;
+    margin: 0 0 12px;
+    text-wrap: balance;
+  }
+  .lede { color: var(--ink-2); max-width: 62ch; margin: 0; font-size: 15.5px; }
+
+  section { margin: 52px 0 0; }
+  .sec-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 4px; }
+  .sec-num {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--muted);
+  }
+  h2 { font-size: 20px; font-weight: 650; letter-spacing: -.01em; margin: 0; text-wrap: balance; }
+  .sec-sub { color: var(--ink-2); font-size: 14px; margin: 4px 0 18px; max-width: 74ch; }
+
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 18px;
+  }
+  .scroller { overflow-x: auto; }
+  .caption { color: var(--muted); font-size: 12.5px; margin: 10px 2px 0; max-width: 80ch; }
+  .caption strong { color: var(--ink-2); font-weight: 600; }
+
+  svg { display: block; }
+  svg text { font-family: var(--mono); }
+  .n-label { font-size: 12px; font-weight: 600; fill: var(--ink); }
+  .n-sub   { font-size: 10px; fill: var(--ink-2); }
+  .n-tiny  { font-size: 9.5px; fill: var(--muted); }
+  .edge-label { font-size: 10px; fill: var(--ink-2); }
+  .axis-t { font-size: 10px; fill: var(--muted); }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 16px; margin: 0 0 14px; font-size: 12px; color: var(--ink-2); }
+  .legend .key { display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); }
+  .swatch { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+
+  table.matrix { border-collapse: collapse; width: 100%; font-size: 13px; }
+  table.matrix th, table.matrix td { padding: 9px 12px; text-align: left; border-bottom: 1px solid var(--grid); vertical-align: top; }
+  table.matrix th { font-family: var(--mono); font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+  table.matrix td:first-child { font-family: var(--mono); font-size: 12px; white-space: nowrap; color: var(--ink); }
+  table.matrix .num { font-variant-numeric: tabular-nums; }
+  .yes { color: var(--good-text); font-weight: 600; }
+  .no  { color: var(--critical); font-weight: 700; }
+  .dim { color: var(--muted); }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; }
+  .tile { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 18px 20px; }
+  .tile .v { font-size: 34px; font-weight: 700; letter-spacing: -.02em; line-height: 1.1; }
+  .tile .v .unit { font-size: 15px; font-weight: 500; color: var(--ink-2); }
+  .tile .k { font-family: var(--mono); font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); margin-top: 6px; }
+
+  .chain { display: flex; flex-wrap: wrap; gap: 10px; align-items: stretch; margin-top: 18px; }
+  .link-card {
+    flex: 1 1 190px;
+    background: var(--accent-soft);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+    position: relative;
+  }
+  .link-card .step { font-family: var(--mono); font-size: 10px; color: var(--accent); letter-spacing: .1em; text-transform: uppercase; }
+  .link-card .t { font-size: 13.5px; font-weight: 650; margin: 3px 0 2px; }
+  .link-card .d { font-size: 12px; color: var(--ink-2); }
+
+  #tip {
+    position: fixed;
+    pointer-events: none;
+    background: var(--ink);
+    color: var(--page);
+    font-family: var(--mono);
+    font-size: 11.5px;
+    padding: 6px 9px;
+    border-radius: 6px;
+    max-width: 280px;
+    line-height: 1.4;
+    opacity: 0;
+    transition: opacity .12s;
+    z-index: 10;
+  }
+  @media (prefers-reduced-motion: reduce) { #tip { transition: none; } }
+  [data-tip] { cursor: default; }
+  rect[data-tip]:hover, g[data-tip]:hover rect { filter: brightness(1.08); }
+
+  footer.colophon { margin-top: 56px; color: var(--muted); font-size: 12px; font-family: var(--mono); border-top: 1px solid var(--grid); padding-top: 14px; }
+</style>
+
+<div class="wrap">
+
+<header class="masthead">
+  <p class="eyebrow">scada · apache flink 2.0 · kafka · demo report</p>
+  <h1>One pipeline, four faults, zero duplicates</h1>
+  <p class="lede">A simulated electrical grid streams telemetry through Flink CEP into Postgres.
+  We killed its TaskManager, cut its network, stopped its broker, and restarted its coordinator —
+  live. Every number below is measured, not theoretical.</p>
+</header>
+
+<!-- ============ 1. PIPELINE FLOW ============ -->
+<section>
+  <div class="sec-head"><span class="sec-num">01</span><h2>The pipeline</h2></div>
+  <p class="sec-sub">Five stages, three Kafka topics. Ten grid components (feeders, breakers, transformers
+  across two substations) emit one reading per second each.</p>
+  <div class="panel scroller">
+    <svg width="1024" height="238" viewBox="0 0 1024 238" role="img" aria-label="Pipeline flow diagram: simulator to Kafka to Flink to Kafka to Spring API to Postgres and SSE">
+      <!-- simulator -->
+      <g>
+        <rect x="8" y="76" width="140" height="86" rx="8" fill="var(--surface)" stroke="var(--baseline)"/>
+        <text x="78" y="103" text-anchor="middle" class="n-label">scada-simulator</text>
+        <text x="78" y="120" text-anchor="middle" class="n-sub">Python · 10 components</text>
+        <text x="78" y="135" text-anchor="middle" class="n-sub">random walk + fault scripts</text>
+        <text x="78" y="151" text-anchor="middle" class="n-tiny">producer acks=0</text>
+      </g>
+      <!-- edge 1 -->
+      <line x1="148" y1="119" x2="216" y2="119" stroke="var(--accent)" stroke-width="2"/>
+      <polygon points="216,119 208,114 208,124" fill="var(--accent)"/>
+      <text x="182" y="106" text-anchor="middle" class="edge-label">10 ev/s</text>
+      <!-- topic telemetry -->
+      <g>
+        <rect x="218" y="94" width="164" height="50" rx="25" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="300" y="115" text-anchor="middle" class="n-label" fill="var(--accent)">scada.telemetry</text>
+        <text x="300" y="131" text-anchor="middle" class="n-sub">key = componentId</text>
+      </g>
+      <!-- edge 2 -->
+      <line x1="382" y1="119" x2="448" y2="119" stroke="var(--accent)" stroke-width="2"/>
+      <polygon points="448,119 440,114 440,124" fill="var(--accent)"/>
+      <!-- flink -->
+      <g>
+        <rect x="450" y="56" width="172" height="126" rx="8" fill="var(--surface)" stroke="var(--accent)" stroke-width="1.5"/>
+        <text x="536" y="82" text-anchor="middle" class="n-label">Flink job</text>
+        <text x="536" y="100" text-anchor="middle" class="n-sub">1 aggregation branch</text>
+        <text x="536" y="115" text-anchor="middle" class="n-sub">4 CEP branches</text>
+        <text x="536" y="134" text-anchor="middle" class="n-tiny">checkpoints every 10 s</text>
+        <text x="536" y="148" text-anchor="middle" class="n-tiny">exactly-once sinks</text>
+        <text x="536" y="162" text-anchor="middle" class="n-tiny">2 TaskManagers (1 standby)</text>
+      </g>
+      <!-- edges to topics -->
+      <line x1="622" y1="94" x2="688" y2="74" stroke="var(--accent)" stroke-width="2"/>
+      <polygon points="688,74 679,73 682,82" fill="var(--accent)"/>
+      <text x="655" y="66" text-anchor="middle" class="edge-label">~10 / 30 s</text>
+      <line x1="622" y1="146" x2="688" y2="166" stroke="var(--aqua)" stroke-width="2"/>
+      <polygon points="688,166 682,158 679,167" fill="var(--aqua)"/>
+      <text x="655" y="185" text-anchor="middle" class="edge-label">sporadic</text>
+      <!-- topics out -->
+      <g>
+        <rect x="690" y="46" width="168" height="46" rx="23" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="774" y="65" text-anchor="middle" class="n-label" fill="var(--accent)">scada.aggregates</text>
+        <text x="774" y="81" text-anchor="middle" class="n-sub">30 s window stats</text>
+      </g>
+      <g>
+        <rect x="690" y="146" width="168" height="46" rx="23" fill="var(--accent-soft)" stroke="var(--aqua)"/>
+        <text x="774" y="165" text-anchor="middle" class="n-label" fill="var(--aqua)">scada.alerts</text>
+        <text x="774" y="181" text-anchor="middle" class="n-sub">CEP matches</text>
+      </g>
+      <!-- edges to spring -->
+      <line x1="858" y1="69" x2="912" y2="103" stroke="var(--baseline)" stroke-width="2"/>
+      <polygon points="912,103 903,101 905,110" fill="var(--baseline)"/>
+      <line x1="858" y1="169" x2="912" y2="135" stroke="var(--baseline)" stroke-width="2"/>
+      <polygon points="912,135 905,128 903,137" fill="var(--baseline)"/>
+      <!-- spring -->
+      <g>
+        <rect x="880" y="80" width="136" height="80" rx="8" fill="var(--surface)" stroke="var(--baseline)"/>
+        <text x="948" y="104" text-anchor="middle" class="n-label">Spring API</text>
+        <text x="948" y="120" text-anchor="middle" class="n-sub">read_committed</text>
+        <text x="948" y="135" text-anchor="middle" class="n-sub">→ Postgres (JPA)</text>
+        <text x="948" y="150" text-anchor="middle" class="n-sub">→ SSE + REST :8096</text>
+      </g>
+    </svg>
+  </div>
+  <p class="caption"><strong>Read the edges:</strong> throughput drops five-hundred-fold across the job —
+  10 raw events/s in, roughly 10 aggregate rows per 30 s plus occasional alerts out. The simulator's
+  <span style="font-family:var(--mono)">acks=0</span> producer means anything upstream of Kafka is fire-and-forget.</p>
+</section>
+
+<!-- ============ 2. JOB DAG ============ -->
+<section>
+  <div class="sec-head"><span class="sec-num">02</span><h2>Inside the Flink job</h2></div>
+  <p class="sec-sub">One shared source fans out into five branches. Four are CEP pattern matchers; each is
+  badged with its key and match window. Only one pattern correlates <em>across</em> devices.</p>
+  <div class="panel scroller">
+    <svg width="1024" height="384" viewBox="0 0 1024 384" role="img" aria-label="Flink job DAG: Kafka source fanning out to one aggregation branch and four CEP branches, converging into two sinks">
+      <!-- source -->
+      <g>
+        <rect x="8" y="162" width="130" height="60" rx="8" fill="var(--surface)" stroke="var(--baseline)"/>
+        <text x="73" y="187" text-anchor="middle" class="n-label">KafkaSource</text>
+        <text x="73" y="203" text-anchor="middle" class="n-sub">committed offsets</text>
+      </g>
+      <!-- watermarks node -->
+      <g>
+        <rect x="170" y="162" width="120" height="60" rx="8" fill="var(--surface)" stroke="var(--baseline)"/>
+        <text x="230" y="185" text-anchor="middle" class="n-label">watermarks</text>
+        <text x="230" y="200" text-anchor="middle" class="n-sub">±5 s · idle 30 s</text>
+        <text x="230" y="214" text-anchor="middle" class="n-tiny">event time</text>
+      </g>
+      <line x1="138" y1="192" x2="170" y2="192" stroke="var(--baseline)" stroke-width="2"/>
+      <!-- fan-out lines -->
+      <path d="M290 192 C 330 192 330 42 370 42"  fill="none" stroke="var(--accent)" stroke-width="2"/>
+      <path d="M290 192 C 330 192 330 118 370 118" fill="none" stroke="var(--aqua)" stroke-width="2"/>
+      <path d="M290 192 C 330 192 330 192 370 192" fill="none" stroke="var(--aqua)" stroke-width="2"/>
+      <path d="M290 192 C 330 192 330 266 370 266" fill="none" stroke="var(--aqua)" stroke-width="2"/>
+      <path d="M290 192 C 330 192 330 340 370 340" fill="none" stroke="var(--aqua)" stroke-width="2"/>
+      <!-- Branch A -->
+      <g data-tip="keyBy(componentId) → 30 s tumbling event-time window → incremental AggregateFunction (count/avg/min/max, O(1) state) → JSON">
+        <rect x="370" y="14" width="300" height="56" rx="8" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.5"/>
+        <text x="384" y="36" class="n-label">A · windowed aggregation</text>
+        <text x="384" y="54" class="n-sub">key componentId · tumbling 30 s · avg/min/max</text>
+      </g>
+      <!-- Branch B -->
+      <g data-tip="FEEDER voltage < 0.90 × nominal, ×3 → followedBy BREAKER OPEN, within 30 s. Correlates two different devices in the same substation.">
+        <rect x="370" y="90" width="300" height="56" rx="8" fill="var(--surface)" stroke="var(--aqua)" stroke-width="1.5" stroke-dasharray="5 3"/>
+        <text x="384" y="112" class="n-label">B · VOLTAGE_SAG_BREAKER_TRIP</text>
+        <text x="384" y="130" class="n-sub">key substationId · sag ×3 → trip · 30 s</text>
+        <text x="662" y="112" text-anchor="end" class="n-tiny" fill="var(--aqua)">cross-component ⤴</text>
+      </g>
+      <!-- Branch C -->
+      <g data-tip="TRANSFORMER oilTemp in (90, 105] (warming) → followedBy oilTemp > 105 (critical), within 90 s">
+        <rect x="370" y="164" width="300" height="56" rx="8" fill="var(--surface)" stroke="var(--aqua)" stroke-width="1.5"/>
+        <text x="384" y="186" class="n-label">C · TRANSFORMER_OVERHEAT</text>
+        <text x="384" y="204" class="n-sub">key componentId · 90→105 °C · 90 s</text>
+      </g>
+      <!-- Branch D -->
+      <g data-tip="BREAKER OPEN → CLOSED → OPEN → CLOSED (relaxed contiguity), within 30 s">
+        <rect x="370" y="238" width="300" height="56" rx="8" fill="var(--surface)" stroke="var(--aqua)" stroke-width="1.5"/>
+        <text x="384" y="260" class="n-label">D · BREAKER_FLAPPING</text>
+        <text x="384" y="278" class="n-sub">key componentId · 2× open/close cycle · 30 s</text>
+      </g>
+      <!-- Branch E -->
+      <g data-tip="FEEDER current > 480 A (1.2 × rated), ×5 strictly consecutive, within 20 s">
+        <rect x="370" y="312" width="300" height="56" rx="8" fill="var(--surface)" stroke="var(--aqua)" stroke-width="1.5"/>
+        <text x="384" y="334" class="n-label">E · SUSTAINED_OVERCURRENT</text>
+        <text x="384" y="352" class="n-sub">key componentId · &gt;480 A ×5 consecutive · 20 s</text>
+      </g>
+      <!-- converge lines -->
+      <path d="M670 42 C 720 42 720 62 770 62" fill="none" stroke="var(--accent)" stroke-width="2"/>
+      <path d="M670 118 C 716 118 716 262 762 262" fill="none" stroke="var(--aqua)" stroke-width="2"/>
+      <path d="M670 192 C 716 192 716 262 762 262" fill="none" stroke="var(--aqua)" stroke-width="2"/>
+      <path d="M670 266 C 716 266 716 262 762 262" fill="none" stroke="var(--aqua)" stroke-width="2"/>
+      <path d="M670 340 C 716 340 716 262 762 262" fill="none" stroke="var(--aqua)" stroke-width="2"/>
+      <!-- union node -->
+      <g>
+        <rect x="762" y="242" width="72" height="40" rx="20" fill="var(--surface)" stroke="var(--aqua)"/>
+        <text x="798" y="266" text-anchor="middle" class="n-sub" fill="var(--aqua)">union</text>
+      </g>
+      <line x1="834" y1="262" x2="874" y2="262" stroke="var(--aqua)" stroke-width="2"/>
+      <!-- sinks -->
+      <g data-tip="KafkaSink, DeliveryGuarantee.EXACTLY_ONCE — one Kafka transaction per checkpoint">
+        <rect x="770" y="34" width="244" height="56" rx="8" fill="var(--surface)" stroke="var(--accent)"/>
+        <text x="784" y="56" class="n-label">sink → scada.aggregates</text>
+        <text x="784" y="74" class="n-sub">transactional · exactly-once</text>
+      </g>
+      <g data-tip="KafkaSink, DeliveryGuarantee.EXACTLY_ONCE — one Kafka transaction per checkpoint">
+        <rect x="770" y="234" width="244" height="56" rx="8" fill="var(--surface)" stroke="var(--aqua)"/>
+        <text x="784" y="256" class="n-label">sink → scada.alerts</text>
+        <text x="784" y="274" class="n-sub">transactional · exactly-once</text>
+      </g>
+    </svg>
+  </div>
+  <p class="caption"><strong>The dashed branch is the interesting one:</strong> B keys by
+  <span style="font-family:var(--mono)">substationId</span>, not
+  <span style="font-family:var(--mono)">componentId</span> — a feeder's voltage sag and a
+  <em>different device's</em> breaker trip are matched inside one pattern. Hover any node for its exact condition.</p>
+</section>
+
+<!-- ============ 3. LATENCY WATERFALL ============ -->
+<section>
+  <div class="sec-head"><span class="sec-num">03</span><h2>Where the latency lives</h2></div>
+  <p class="sec-sub">Worst-case path from a telemetry event to a visible aggregate row. Exactly-once is the
+  smallest slice — the window itself dominates.</p>
+  <div class="panel scroller">
+    <svg width="960" height="150" viewBox="0 0 960 150" role="img" aria-label="Latency waterfall: 30 seconds window close, 5 seconds watermark delay, up to 10 seconds checkpoint commit; total up to 45 seconds">
+      <!-- axis -->
+      <line x1="70" y1="104" x2="925" y2="104" stroke="var(--baseline)"/>
+      <g class="axis-t">
+        <text x="70"  y="122" text-anchor="middle">0</text>
+        <text x="260" y="122" text-anchor="middle">10 s</text>
+        <text x="450" y="122" text-anchor="middle">20 s</text>
+        <text x="640" y="122" text-anchor="middle">30 s</text>
+        <text x="830" y="122" text-anchor="middle">40 s</text>
+        <text x="925" y="122" text-anchor="middle">45 s</text>
+      </g>
+      <g stroke="var(--grid)">
+        <line x1="260" y1="40" x2="260" y2="104"/><line x1="450" y1="40" x2="450" y2="104"/>
+        <line x1="640" y1="40" x2="640" y2="104"/><line x1="830" y1="40" x2="830" y2="104"/>
+      </g>
+      <!-- segments: 19px per second, x0=70 -->
+      <rect x="70"  y="62" width="568" height="30" rx="4" fill="var(--seq-a)" data-tip="Tumbling event-time window: results exist only when the 30 s window closes"/>
+      <rect x="640" y="62" width="93"  height="30" rx="4" fill="var(--seq-b)" data-tip="Bounded out-of-orderness watermark: the window fires 5 s after its end time"/>
+      <rect x="735" y="62" width="188" height="30" rx="4" fill="var(--seq-c)" data-tip="Exactly-once sink: rows are visible to read_committed consumers only when the next checkpoint (≤10 s away) commits the Kafka transaction"/>
+      <text x="354" y="53" text-anchor="middle" class="n-sub">window close · 30 s</text>
+      <text x="686" y="53" text-anchor="middle" class="n-sub">watermark · 5 s</text>
+      <text x="829" y="53" text-anchor="middle" class="n-sub">checkpoint commit · ≤10 s</text>
+      <text x="70" y="30" class="n-label">event occurs</text>
+      <text x="925" y="30" text-anchor="end" class="n-label" fill="var(--good-text)">row visible ≤45 s</text>
+    </svg>
+  </div>
+  <p class="caption">Alerts skip the 30 s slice — CEP emits as soon as a pattern completes — but still pay
+  the watermark and checkpoint-commit slices. That commit slice is the price of the zero-duplicates result in §06.</p>
+</section>
+
+<!-- ============ 4. FAULT TIMELINES ============ -->
+<section>
+  <div class="sec-head"><span class="sec-num">04</span><h2>Four faults, measured</h2></div>
+  <p class="sec-sub">Each lane starts at the moment of injection. Ticks are the 10 s checkpoint cadence —
+  the maximum amount of reprocessing any recovery ever needs.</p>
+  <div class="legend">
+    <span class="key"><span class="swatch" style="background:var(--critical)"></span>fault / hard down</span>
+    <span class="key"><span class="swatch" style="background:var(--warning)"></span>undetected — job still reports RUNNING</span>
+    <span class="key"><span class="swatch" style="background:var(--serious)"></span>recovering</span>
+    <span class="key"><span class="swatch" style="background:var(--good)"></span>healthy</span>
+  </div>
+  <div class="panel scroller">
+    <svg width="1010" height="386" viewBox="0 0 1010 386" role="img" aria-label="Four fault scenario timelines with detection and recovery phases">
+      <!-- x scale: x = 170 + s * 14, 0..58s -->
+      <g stroke="var(--grid)">
+        <line x1="170" y1="30" x2="170" y2="330"/><line x1="310" y1="30" x2="310" y2="330"/>
+        <line x1="450" y1="30" x2="450" y2="330"/><line x1="590" y1="30" x2="590" y2="330"/>
+        <line x1="730" y1="30" x2="730" y2="330"/><line x1="870" y1="30" x2="870" y2="330"/>
+      </g>
+      <g class="axis-t">
+        <text x="170" y="352" text-anchor="middle">0 s</text><text x="310" y="352" text-anchor="middle">10 s</text>
+        <text x="450" y="352" text-anchor="middle">20 s</text><text x="590" y="352" text-anchor="middle">30 s</text>
+        <text x="730" y="352" text-anchor="middle">40 s</text><text x="870" y="352" text-anchor="middle">50 s</text>
+      </g>
+      <text x="170" y="20" class="n-tiny">↓ checkpoint ticks every 10 s</text>
+
+      <!-- Lane 1: kill-taskmanager  y=52 -->
+      <text x="158" y="66" text-anchor="end" class="n-label">kill-taskmanager</text>
+      <text x="158" y="81" text-anchor="end" class="n-tiny">SIGKILL busy TM</text>
+      <rect x="168" y="52" width="6" height="26" fill="var(--critical)" data-tip="t=0: SIGKILL the TaskManager hosting the job"/>
+      <rect x="176" y="56" width="272" height="18" rx="4" fill="var(--warning)" data-tip="0–20 s: TCP connection loss being detected; job still reports RUNNING"/>
+      <rect x="450" y="56" width="68"  height="18" rx="4" fill="var(--serious)" data-tip="~20–25 s: tasks redeploy to the standby TM"/>
+      <rect x="520" y="56" width="450" height="18" rx="4" fill="var(--good)" data-tip="~25 s: RUNNING on standby TM, state restored from checkpoint 24. Zero duplicates."/>
+      <text x="525" y="93" class="n-tiny">restored from checkpoint · state + offsets intact</text>
+
+      <!-- Lane 2: network-partition  y=124 -->
+      <text x="158" y="138" text-anchor="end" class="n-label">network-partition</text>
+      <text x="158" y="153" text-anchor="end" class="n-tiny">TM alive, unreachable</text>
+      <rect x="168" y="124" width="6" height="26" fill="var(--critical)" data-tip="t=0: docker network disconnect — process keeps running"/>
+      <rect x="176" y="128" width="692" height="18" rx="4" fill="var(--warning)" data-tip="0–50 s silent zone: heartbeats missing but not yet timed out; JobManager still believes the TM is healthy"/>
+      <rect x="870" y="128" width="34" height="18" rx="4" fill="var(--serious)" data-tip="~50 s: heartbeat timeout fires; failover to standby TM"/>
+      <rect x="906" y="128" width="64" height="18" rx="4" fill="var(--good)" data-tip="Restored from checkpoint on the other TM — identical recovery to a kill"/>
+      <text x="522" y="122" text-anchor="middle" class="n-tiny" fill="var(--ink-2)">← silent zone: heartbeat.timeout = 50 s →</text>
+      <text x="864" y="165" text-anchor="end" class="n-tiny">same recovery as a kill — detection is the whole cost</text>
+
+      <!-- Lane 3: kafka-outage  y=196 -->
+      <text x="158" y="210" text-anchor="end" class="n-label">kafka-outage</text>
+      <text x="158" y="225" text-anchor="end" class="n-tiny">broker stopped 30 s</text>
+      <rect x="168" y="196" width="6" height="26" fill="var(--critical)" data-tip="t=0: docker stop scada-kafka"/>
+      <rect x="176" y="200" width="412" height="18" rx="4" fill="var(--warning)" data-tip="0–30 s: Kafka clients buffer and retry (producer delivery timeout = 2 min ≫ outage). Job RUNNING throughout; checkpoints stall (2 failed)."/>
+      <rect x="590" y="200" width="138" height="18" rx="4" fill="var(--serious)" data-tip="30–40 s: broker back; first fresh completed checkpoint proves end-to-end health"/>
+      <rect x="730" y="200" width="240" height="18" rx="4" fill="var(--good)" data-tip="Checkpoints completing again; no restore ever happened"/>
+      <text x="384" y="237" text-anchor="middle" class="n-tiny">job never restarted — connector retries absorbed the fault</text>
+
+      <!-- Lane 4: restart-jobmanager  y=268 -->
+      <text x="158" y="282" text-anchor="end" class="n-label">restart-jobmanager</text>
+      <text x="158" y="297" text-anchor="end" class="n-tiny">coordinator lost, no HA</text>
+      <rect x="168" y="268" width="76" height="26" rx="4" fill="var(--critical)" data-tip="0–5 s: JobManager down; REST unreachable; TaskManagers leaderless"/>
+      <rect x="246" y="272" width="552" height="18" rx="4" fill="var(--serious)" data-tip="5–45 s: standalone-job resubmits the job FRESH. Checkpoint metadata lived in JM memory → all window/CEP state lost. Source falls back to committed offsets."/>
+      <rect x="800" y="272" width="170" height="18" rx="4" fill="var(--good)" data-tip="~45 s: fresh job's first checkpoint completes (id=1)"/>
+      <text x="522" y="309" text-anchor="middle" class="n-tiny" fill="var(--critical)">state LOST (no HA) · offsets kept — resumed, not skipped</text>
+    </svg>
+  </div>
+  <p class="caption"><strong>Hover any segment for the evidence behind it.</strong> The contrast to notice:
+  a killed process is detected in ~20 s via TCP connection loss, but a <em>silent</em> one costs the full
+  50 s heartbeat timeout. And the Kafka lane never leaves RUNNING — resilience is layered, and the
+  connector's retry layer sits below the restart strategy.</p>
+</section>
+
+<!-- ============ 5. COMPARISON ============ -->
+<section>
+  <div class="sec-head"><span class="sec-num">05</span><h2>Detection is the variable; recovery is the constant</h2></div>
+  <p class="sec-sub">How long until Flink <em>knew</em> something was wrong — and what each fault cost.</p>
+  <div class="panel scroller" style="margin-bottom:14px">
+    <svg width="960" height="196" viewBox="0 0 960 196" role="img" aria-label="Bar chart of detection times: JobManager restart 5 seconds, TaskManager kill about 20 seconds, network partition about 50 seconds, Kafka outage not applicable">
+      <!-- x = 230 + s*13 -->
+      <g stroke="var(--grid)"><line x1="360" y1="14" x2="360" y2="158"/><line x1="490" y1="14" x2="490" y2="158"/><line x1="620" y1="14" x2="620" y2="158"/><line x1="750" y1="14" x2="750" y2="158"/><line x1="880" y1="14" x2="880" y2="158"/></g>
+      <g class="axis-t">
+        <text x="230" y="176" text-anchor="middle">0</text><text x="360" y="176" text-anchor="middle">10 s</text>
+        <text x="490" y="176" text-anchor="middle">20 s</text><text x="620" y="176" text-anchor="middle">30 s</text>
+        <text x="750" y="176" text-anchor="middle">40 s</text><text x="880" y="176" text-anchor="middle">50 s</text>
+      </g>
+      <line x1="230" y1="14" x2="230" y2="158" stroke="var(--baseline)"/>
+      <text x="220" y="32" text-anchor="end" class="n-sub">restart-jobmanager</text>
+      <rect x="230" y="20" width="65" height="18" rx="4" fill="var(--seq-b)" data-tip="~5 s: container restart is immediately visible — REST endpoint drops"/>
+      <text x="303" y="34" class="n-label">~5 s · container restart</text>
+      <text x="220" y="72" text-anchor="end" class="n-sub">kill-taskmanager</text>
+      <rect x="230" y="60" width="260" height="18" rx="4" fill="var(--seq-b)" data-tip="~20 s: TCP connection loss"/>
+      <text x="498" y="74" class="n-label">~20 s · connection loss</text>
+      <text x="220" y="112" text-anchor="end" class="n-sub">network-partition</text>
+      <rect x="230" y="100" width="650" height="18" rx="4" fill="var(--seq-b)" data-tip="~50 s: heartbeat.timeout — the process is alive, so only missed heartbeats reveal it"/>
+      <text x="874" y="94" text-anchor="end" class="n-label">~50 s · heartbeat timeout</text>
+      <text x="220" y="152" text-anchor="end" class="n-sub">kafka-outage</text>
+      <text x="238" y="152" class="n-sub" style="font-style:italic">detection never needed — clients retried through it</text>
+    </svg>
+  </div>
+  <div class="panel scroller">
+    <table class="matrix">
+      <thead>
+        <tr><th>scenario</th><th>detected by</th><th>time to healthy</th><th>job restarted</th><th>state kept</th><th>offsets kept</th><th>duplicates</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>kill-taskmanager</td><td>TCP connection loss</td><td class="num">~25 s</td><td>yes — failover</td><td class="yes">✓ checkpoint</td><td class="yes">✓ checkpoint</td><td class="num yes">0</td></tr>
+        <tr><td>network-partition</td><td>heartbeat timeout</td><td class="num">~50 s</td><td>yes — failover</td><td class="yes">✓ checkpoint</td><td class="yes">✓ checkpoint</td><td class="num yes">0</td></tr>
+        <tr><td>kafka-outage</td><td class="dim">— (rode it out)</td><td class="num">~10 s after broker back</td><td class="dim">no</td><td class="yes">✓ never lost</td><td class="yes">✓</td><td class="num yes">0</td></tr>
+        <tr><td>restart-jobmanager</td><td>container restart</td><td class="num">~45 s (fresh ckpt)</td><td>yes — fresh job</td><td class="no">✗ lost — no HA</td><td class="yes">✓ committed offsets</td><td class="num yes">0</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="caption">One cell in the whole matrix is red: JobManager loss without high availability.
+  Checkpoint metadata lives in JobManager memory, so the files on disk are orphaned and the job restarts
+  from scratch — the demo's built-in argument for ZooKeeper/Kubernetes HA.</p>
+</section>
+
+<!-- ============ 6. PROOF ============ -->
+<section>
+  <div class="sec-head"><span class="sec-num">06</span><h2>The exactly-once receipt</h2></div>
+  <p class="sec-sub">After all four faults, run back-to-back against the live stack:</p>
+  <div class="tiles">
+    <div class="tile"><div class="v num">260</div><div class="k">aggregate rows in Postgres</div></div>
+    <div class="tile"><div class="v num" style="color:var(--good-text)">0</div><div class="k">duplicate (component, window) pairs</div></div>
+    <div class="tile"><div class="v num">4<span class="unit">/4</span></div><div class="k">faults recovered</div></div>
+    <div class="tile"><div class="v num">10<span class="unit">s</span></div><div class="k">max reprocessing window</div></div>
+  </div>
+  <div class="chain">
+    <div class="link-card"><div class="step">link 1 · source</div><div class="t">Committed offsets</div><div class="d">Offsets are committed to Kafka at every checkpoint — a fresh job resumes, never skips.</div></div>
+    <div class="link-card"><div class="step">link 2 · state</div><div class="t">Checkpointed state</div><div class="d">Windows and CEP matches snapshot every 10 s to a volume both TaskManagers share.</div></div>
+    <div class="link-card"><div class="step">link 3 · sink</div><div class="t">Transactional writes</div><div class="d">Each checkpoint commits one Kafka transaction; a crash aborts it instead of half-writing.</div></div>
+    <div class="link-card"><div class="step">link 4 · consumer</div><div class="t">read_committed</div><div class="d">The Spring API never sees aborted transactions, so Postgres and the SSE stream stay clean.</div></div>
+  </div>
+  <p class="caption">Offsets, state, and output move <strong>atomically</strong> — all four links restore to the
+  same checkpoint, which is why replayed records never become duplicate rows.</p>
+</section>
+
+<footer class="colophon">
+  sources: PIPELINE-STRUCTURE.md · FAULT-SCENARIOS.md — measured on live runs of ./fault-scenarios.sh ·
+  flink 2.0.0 · kafka 3.9.0 (kraft) · postgres 16
+</footer>
+
+</div>
+
+<div id="tip" role="tooltip"></div>
+<script>
+  const tip = document.getElementById('tip');
+  document.querySelectorAll('[data-tip]').forEach(el => {
+    el.addEventListener('mousemove', e => {
+      tip.textContent = el.getAttribute('data-tip');
+      tip.style.opacity = '1';
+      const pad = 14;
+      let x = e.clientX + pad, y = e.clientY + pad;
+      const r = tip.getBoundingClientRect();
+      if (x + r.width > window.innerWidth - 8) x = e.clientX - r.width - pad;
+      if (y + r.height > window.innerHeight - 8) y = e.clientY - r.height - pad;
+      tip.style.left = x + 'px';
+      tip.style.top = y + 'px';
+    });
+    el.addEventListener('mouseleave', () => { tip.style.opacity = '0'; });
+  });
+</script>
