@@ -2,6 +2,8 @@
 
 End-to-end streaming pipeline: simulated electrical-distribution components (PLCs/RTUs) → Kafka → Apache Flink (CEP pattern matching + windowed aggregates) → Kafka → Spring Boot API → Postgres + SSE.
 
+New to streaming or SCADA? [GLOSSARY.md](GLOSSARY.md) explains every technical term in this repo in one sentence each, aimed at web developers.
+
 ## Quick Start
 
 ```bash
