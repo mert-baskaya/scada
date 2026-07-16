@@ -100,13 +100,35 @@ CEP patterns use `AfterMatchSkipStrategy.skipPastLastEvent()` per pattern and re
    - FEEDER with `current > 1.2 × 400A` (480 A), 5 consecutive readings
    - `within(20s)`
 
+## Pipeline Modes & Load Testing
+
+The Flink job runs in one of three modes, selected with the `PIPELINE_MODE` env var
+(see [LOAD-TEST.md](LOAD-TEST.md) for the measured numbers and the full story):
+
+| Mode | Detection | Sinks | Measured ceiling (single machine) |
+|---|---|---|---|
+| `cep` (default) | 4 CEP patterns on the full stream | exactly-once | ~150k ev/s, OOM-collapses at 200k+ |
+| `fast` | keyed process functions, one shuffle | at-least-once | 1M ev/s |
+| `hybrid` | same CEP patterns behind pre-filters (overcurrent restructured) | exactly-once | 1M ev/s, CEP ops ~0.3% busy |
+
+```bash
+# run the job in hybrid mode
+PIPELINE_MODE=hybrid docker compose up -d flink-jobmanager flink-taskmanager flink-taskmanager-2
+
+# blast 1M events/s from a 10,000-component fleet (profile keeps it out of normal runs)
+TARGET_EPS=1000000 docker compose --profile loadtest up -d load-generator
+
+# measure: produce rate, Flink throughput, consumer lag, operator busyness, checkpoints
+./loadtest-report.sh 300 20
+```
+
 ## Infrastructure Fault Scenarios (Flink Fault Tolerance)
 
 Beyond the simulated *grid* faults above, the stack is configured to demonstrate Flink's own fault tolerance:
 
 - **Checkpointing**: every 10 s, exactly-once mode, stored on a shared volume (`file:///opt/flink/checkpoints`).
 - **Restart strategy**: exponential-delay (1 s initial, 30 s max backoff).
-- **Two TaskManagers**: the job runs on one; the other is standby capacity for instant failover.
+- **Two TaskManagers**: with the load-test config (`parallelism.default: 8`) the job spans both, so a killed TaskManager recovers via container restart + checkpoint restore; set `parallelism.default: 1` to reproduce the original idle-standby instant failover.
 - **Exactly-once end-to-end**: transactional Kafka sinks + `read_committed` Spring consumer. Results become visible when a checkpoint completes, so aggregates/alerts trail by up to ~10 s.
 
 Inject faults with the harness (each prints before/after evidence — job state, checkpoint restore id, TaskManager registrations, downstream row counts):

@@ -5,6 +5,11 @@ import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import demo.flink.cep.AlertFunctions;
 import demo.flink.cep.FaultPatterns;
+import demo.flink.fast.ComponentDetectorFunction;
+import demo.flink.fast.SubstationSagTripFunction;
+import demo.flink.hybrid.BreakerStatusChangeFunction;
+import demo.flink.hybrid.OvercurrentDetector;
+import demo.flink.hybrid.PreFilters;
 import demo.flink.model.ComponentAggregate;
 import demo.flink.model.GridAlert;
 import demo.flink.model.GridTelemetry;
@@ -68,20 +73,48 @@ public class ScadaStreamingJob {
                 .withTimestampAssigner((event, ts) -> event.getTimestamp().toEpochMilli())
                 .withIdleness(Duration.ofSeconds(30));
 
+        // "fast" replaces CEP with keyed process functions and relaxes the sinks to
+        // at-least-once, trading exact CEP semantics for ~10x higher throughput.
+        // "hybrid" keeps the CEP patterns but pre-filters their input down to the
+        // rare relevant events, so CEP never buffers the full stream.
+        String pipelineMode = System.getenv().getOrDefault("PIPELINE_MODE", "cep");
+        boolean fast = "fast".equalsIgnoreCase(pipelineMode);
+        boolean hybrid = "hybrid".equalsIgnoreCase(pipelineMode);
+        if (fast || hybrid) {
+            env.getConfig().enableObjectReuse();
+        }
+
         DataStream<GridTelemetry> readings = env
                 .fromSource(source, watermarkStrategy, "Kafka Source");
 
-        KafkaSink<String> aggregateSink = KafkaSink.<String>builder()
-                .setBootstrapServers(bootstrapServers)
-                .setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
-                .setTransactionalIdPrefix("scada-aggregates")
-                // Flink's default (1h) exceeds the broker's transaction.max.timeout.ms (15m)
-                .setProperty("transaction.timeout.ms", "600000")
-                .setRecordSerializer(KafkaRecordSerializationSchema.builder()
-                        .setTopic("scada.aggregates")
-                        .setValueSerializationSchema(new SimpleStringSchema())
-                        .build())
-                .build();
+        KafkaSink<String> aggregateSink = jsonSink(bootstrapServers, "scada.aggregates", !fast, "scada-aggregates");
+        KafkaSink<String> alertSink = jsonSink(bootstrapServers, "scada.alerts", !fast, "scada-alerts");
+
+        if (fast) {
+            var detected = readings
+                    .keyBy(GridTelemetry::getComponentId)
+                    .process(new ComponentDetectorFunction())
+                    .name("UNIFIED_DETECTOR");
+
+            detected
+                    .map(new AggregateToJson())
+                    .sinkTo(aggregateSink)
+                    .name("Aggregate Sink");
+
+            DataStream<GridAlert> sagAlerts = readings
+                    .keyBy(GridTelemetry::getSubstationId)
+                    .process(new SubstationSagTripFunction())
+                    .name("SAG_TRIP_DETECTOR");
+
+            detected.getSideOutput(ComponentDetectorFunction.ALERTS)
+                    .union(sagAlerts)
+                    .map(new AlertToJson())
+                    .sinkTo(alertSink)
+                    .name("Alert Sink");
+
+            env.execute("SCADA Streaming Job (fast path)");
+            return;
+        }
 
         readings
                 .keyBy(GridTelemetry::getComponentId)
@@ -91,16 +124,41 @@ public class ScadaStreamingJob {
                 .sinkTo(aggregateSink)
                 .name("Aggregate Sink");
 
-        KafkaSink<String> alertSink = KafkaSink.<String>builder()
-                .setBootstrapServers(bootstrapServers)
-                .setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
-                .setTransactionalIdPrefix("scada-alerts")
-                .setProperty("transaction.timeout.ms", "600000")
-                .setRecordSerializer(KafkaRecordSerializationSchema.builder()
-                        .setTopic("scada.alerts")
-                        .setValueSerializationSchema(new SimpleStringSchema())
-                        .build())
-                .build();
+        if (hybrid) {
+            DataStream<GridAlert> sagAlerts = CEP.pattern(
+                    readings.filter(PreFilters::sagTripRelevant).name("SAG_TRIP_FILTER")
+                            .keyBy(GridTelemetry::getSubstationId),
+                    FaultPatterns.voltageSagBreakerTrip()
+            ).inEventTime().process(AlertFunctions.sagTripProcessor()).name("SAG_TRIP_CEP");
+
+            DataStream<GridAlert> overheatAlerts = CEP.pattern(
+                    readings.filter(PreFilters::overheatRelevant).name("OVERHEAT_FILTER")
+                            .keyBy(GridTelemetry::getComponentId),
+                    FaultPatterns.transformerOverheat()
+            ).inEventTime().process(AlertFunctions.overheatProcessor()).name("OVERHEAT_CEP");
+
+            DataStream<GridAlert> flappingAlerts = CEP.pattern(
+                    readings.filter(PreFilters::breakerReading).name("BREAKER_FILTER")
+                            .keyBy(GridTelemetry::getComponentId)
+                            .process(new BreakerStatusChangeFunction()).name("STATUS_CHANGE_FILTER")
+                            .keyBy(GridTelemetry::getComponentId),
+                    FaultPatterns.breakerFlapping()
+            ).inEventTime().process(AlertFunctions.flappingProcessor()).name("FLAPPING_CEP");
+
+            DataStream<GridAlert> overcurrentAlerts = readings
+                    .filter(PreFilters::feederReading).name("FEEDER_FILTER")
+                    .keyBy(GridTelemetry::getComponentId)
+                    .process(new OvercurrentDetector())
+                    .name("OVERCURRENT_DETECTOR");
+
+            sagAlerts.union(overheatAlerts, flappingAlerts, overcurrentAlerts)
+                    .map(new AlertToJson())
+                    .sinkTo(alertSink)
+                    .name("Alert Sink");
+
+            env.execute("SCADA Streaming Job (hybrid CEP)");
+            return;
+        }
 
         DataStream<GridAlert> sagAlerts = CEP.pattern(
                 readings.keyBy(GridTelemetry::getSubstationId),
@@ -128,6 +186,26 @@ public class ScadaStreamingJob {
                 .name("Alert Sink");
 
         env.execute("SCADA Streaming Job with CEP");
+    }
+
+    private static KafkaSink<String> jsonSink(String bootstrapServers, String topic,
+                                              boolean exactlyOnce, String txnPrefix) {
+        var builder = KafkaSink.<String>builder()
+                .setBootstrapServers(bootstrapServers)
+                // required to be unique per sink even for at-least-once delivery
+                .setTransactionalIdPrefix(txnPrefix)
+                .setRecordSerializer(KafkaRecordSerializationSchema.builder()
+                        .setTopic(topic)
+                        .setValueSerializationSchema(new SimpleStringSchema())
+                        .build());
+        if (exactlyOnce) {
+            builder.setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
+                    // Flink's default (1h) exceeds the broker's transaction.max.timeout.ms (15m)
+                    .setProperty("transaction.timeout.ms", "600000");
+        } else {
+            builder.setDeliveryGuarantee(DeliveryGuarantee.AT_LEAST_ONCE);
+        }
+        return builder.build();
     }
 
     private static class AggregateToJson implements MapFunction<ComponentAggregate, String> {

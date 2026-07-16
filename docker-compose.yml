@@ -60,8 +60,10 @@ services:
     command: standalone-job --job-classname demo.flink.ScadaStreamingJob
     restart: always
     environment:
+      PIPELINE_MODE: ${PIPELINE_MODE:-cep}
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
+        parallelism.default: 8
     volumes:
       - flink-checkpoints:/opt/flink/checkpoints
     depends_on:
@@ -78,7 +80,9 @@ services:
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
-        taskmanager.numberOfTaskSlots: 2
+        taskmanager.numberOfTaskSlots: 4
+        taskmanager.memory.process.size: 4g
+        parallelism.default: 8
     volumes:
       - flink-checkpoints:/opt/flink/checkpoints
     depends_on:
@@ -94,11 +98,30 @@ services:
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
-        taskmanager.numberOfTaskSlots: 2
+        taskmanager.numberOfTaskSlots: 4
+        taskmanager.memory.process.size: 4g
+        parallelism.default: 8
     volumes:
       - flink-checkpoints:/opt/flink/checkpoints
     depends_on:
       - flink-jobmanager
+
+  load-generator:
+    build:
+      context: ./load-generator
+      dockerfile: Dockerfile
+    container_name: scada-load-generator
+    profiles: [loadtest]
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      TARGET_EPS: "${TARGET_EPS:-1000000}"
+      NUM_COMPONENTS: "10000"
+      THREADS: "6"
+      DURATION_SECONDS: "0"
+      PARTITIONS: "16"
+    depends_on:
+      kafka:
+        condition: service_healthy
 
   spring-api:
     build:
