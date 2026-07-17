@@ -74,8 +74,10 @@ produce side is never the variable being measured.
 - **Checkpoint health** — completed/failed counts, duration, state size.
 
 Every run started from a freshly recreated topic; measuring against leftover backlog skews lag
-numbers and (in CEP mode) can OOM the job during catch-up. Note: the Kafka *consumer* auto-creates
-the topic with 1 partition if the job starts before the topic exists — always create it explicitly.
+numbers and (in CEP mode) can OOM the job during catch-up. Topic creation is deterministic: the
+`kafka-init` one-shot compose service pre-creates every topic with the right partition counts
+before any producer or the Flink job starts, and broker auto-creation is disabled (historically,
+whichever client touched a topic first auto-created it with 1 partition and capped consumption).
 
 ## 4. CEP Mode: Where and Why It Collapses
 
@@ -192,11 +194,12 @@ happens: the broker routes by type, so no branch deserializes events it will dis
 type's consumption scales independently (partitions and parallelism per topic). The difference
 would show past hybrid's saturation point, or against `cep` mode's ~150k ceiling.
 
-Two operational gotchas, both hit in practice: compose caches images, so `--build` is required
-or the load generator silently keeps publishing to the single topic while the env says split;
-and the low-rate Python simulator can auto-create `scada.telemetry.transformer` with 1 partition
-if it starts before the load generator creates it properly (fix: `kafka-topics.sh --alter`, or
-pre-create).
+One operational gotcha, hit in practice: compose caches images, so `--build` is required after
+code changes or the load generator silently keeps publishing to the single topic while the env
+says split. (A second one — producers racing to auto-create per-type topics with 1 partition —
+is fixed structurally: the `kafka-init` one-shot service pre-creates every topic with the right
+partition counts before any producer or the Flink job starts, and broker auto-creation is
+disabled.)
 
 ## 8. What This Means Off a Laptop
 
@@ -222,7 +225,8 @@ Changes that stay in `docker-compose.yml` (they don't affect the low-rate demo, 
 last one):
 
 - TaskManagers: 4 slots each, `taskmanager.memory.process.size: 4g`, `parallelism.default: 8`.
-- `scada.telemetry` should be pre-created with 16 partitions (see §3 on consumer auto-create).
+- All topics are pre-created by the `kafka-init` one-shot service (telemetry 16 partitions,
+  per-type 2/8/8, results topics 1) with broker auto-creation disabled — see §3.
 - `PIPELINE_MODE` env passes through the jobmanager (`cep` default).
 - **Fault-scenario nuance**: with parallelism 8 the job now occupies all slots on *both*
   TaskManagers, so `kill-taskmanager` no longer fails over to an idle standby — recovery is

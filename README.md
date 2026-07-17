@@ -157,6 +157,105 @@ Inject faults with the harness (each prints before/after evidence — job state,
 | `restart-jobmanager` | The limitation HA solves: without ZooKeeper/K8s HA, checkpoint metadata is lost and the job restarts fresh — but the Kafka source falls back to offsets committed at the last checkpoint, so it resumes rather than skips ahead. |
 | `network-partition` | Failure *detection*: the TaskManager is alive but unreachable; the JobManager notices via heartbeat timeout (~50 s) before the same checkpoint-restore failover as a kill. |
 
+Run them one at a time, with `./fault-scenarios.sh status` showing a healthy job (RUNNING,
+checkpoints advancing) between scenarios — stacking them tests recovery-from-recovery, not each
+scenario.
+
+## Testing Grid-Fault Scenarios Individually
+
+The simulator picks its four fault scripts **randomly** (one every 45–90 s, `simulator.py`) —
+there is no flag to force a specific one. Two ways to test a single CEP pattern:
+
+### Passive: watch one scenario fire
+
+```bash
+# terminal 1 — the cause (injection):
+docker logs -f scada-simulator | grep "scenario"
+
+# terminal 2 — the effect, filtered to one alert type:
+docker exec scada-kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic scada.alerts \
+  | grep --line-buffered VOLTAGE_SAG_BREAKER_TRIP   # or TRANSFORMER_OVERHEAT / BREAKER_FLAPPING / SUSTAINED_OVERCURRENT
+```
+
+All four types cycle through within ~5–10 minutes.
+
+### Deterministic: inject a crafted event sequence
+
+Uses a fake substation `SUB-T` (nominal 34.5 kV — only `SUB-B` is 13.8) so simulator traffic
+never interferes, while its background events keep watermarks advancing. Shell helpers:
+
+```bash
+emit() {  # emit <kafka-key> <json>
+  printf '%s|%s\n' "$1" "$2" | docker exec -i scada-kafka \
+    /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server localhost:9092 \
+    --topic scada.telemetry --property parse.key=true --property key.separator='|'
+}
+now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+```
+
+Expect each alert within ~5–20 s of the last injected event (5 s watermark out-of-orderness
+bound + up to one 10 s checkpoint for the exactly-once sink to commit).
+
+**1. VOLTAGE_SAG_BREAKER_TRIP** — 3 FEEDER readings with `voltage < 0.90 × 34.5 = 31.05`, then
+a BREAKER `OPEN`, same `substationId`, within 30 s:
+
+```bash
+for i in 1 2 3; do
+  emit SUB-T-FDR-1 "{\"componentId\":\"SUB-T-FDR-1\",\"componentType\":\"FEEDER\",\"substationId\":\"SUB-T\",\"voltage\":28.0,\"current\":350.0,\"frequency\":60.0,\"breakerStatus\":null,\"oilTemp\":null,\"tapPosition\":null,\"timestamp\":\"$(now)\"}"
+  sleep 1
+done
+emit SUB-T-BKR-1 "{\"componentId\":\"SUB-T-BKR-1\",\"componentType\":\"BREAKER\",\"substationId\":\"SUB-T\",\"voltage\":34.5,\"current\":0.0,\"frequency\":60.0,\"breakerStatus\":\"OPEN\",\"oilTemp\":null,\"tapPosition\":null,\"timestamp\":\"$(now)\"}"
+```
+
+**2. TRANSFORMER_OVERHEAT** — one TRANSFORMER reading with `90 < oilTemp ≤ 105`, then one with
+`oilTemp > 105`, same component, within 90 s:
+
+```bash
+emit SUB-T-XFMR-1 "{\"componentId\":\"SUB-T-XFMR-1\",\"componentType\":\"TRANSFORMER\",\"substationId\":\"SUB-T\",\"voltage\":34.5,\"current\":300.0,\"frequency\":60.0,\"breakerStatus\":null,\"oilTemp\":95.0,\"tapPosition\":0,\"timestamp\":\"$(now)\"}"
+sleep 2
+emit SUB-T-XFMR-1 "{\"componentId\":\"SUB-T-XFMR-1\",\"componentType\":\"TRANSFORMER\",\"substationId\":\"SUB-T\",\"voltage\":34.5,\"current\":300.0,\"frequency\":60.0,\"breakerStatus\":null,\"oilTemp\":110.0,\"tapPosition\":0,\"timestamp\":\"$(now)\"}"
+```
+
+**3. BREAKER_FLAPPING** — OPEN → CLOSED → OPEN → CLOSED on the same breaker within 30 s:
+
+```bash
+for st in OPEN CLOSED OPEN CLOSED; do
+  emit SUB-T-BKR-2 "{\"componentId\":\"SUB-T-BKR-2\",\"componentType\":\"BREAKER\",\"substationId\":\"SUB-T\",\"voltage\":34.5,\"current\":100.0,\"frequency\":60.0,\"breakerStatus\":\"$st\",\"oilTemp\":null,\"tapPosition\":null,\"timestamp\":\"$(now)\"}"
+  sleep 1
+done
+```
+
+**4. SUSTAINED_OVERCURRENT** — 5 *consecutive* FEEDER readings with `current > 480` within
+20 s. Consecutive means no other readings of that component in between — safe here since
+`SUB-T-FDR-2` has no other traffic. No sleeps: each `docker exec` already costs ~1 s and all
+five must fit inside the 20 s window:
+
+```bash
+for i in 1 2 3 4 5; do
+  emit SUB-T-FDR-2 "{\"componentId\":\"SUB-T-FDR-2\",\"componentType\":\"FEEDER\",\"substationId\":\"SUB-T\",\"voltage\":34.5,\"current\":520.0,\"frequency\":60.0,\"breakerStatus\":null,\"oilTemp\":null,\"tapPosition\":null,\"timestamp\":\"$(now)\"}"
+done
+```
+
+**Verify after each injection:**
+
+```bash
+# straight from Kafka:
+docker exec scada-kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic scada.alerts --from-beginning --timeout-ms 5000 | grep SUB-T
+
+# or through the API (proves the full path incl. Postgres):
+curl -s 'http://localhost:8096/api/alerts?limit=10' | jq '.[] | {componentId, alertType, timestamp}'
+
+# or live via SSE while injecting:
+curl -N http://localhost:8096/api/stream
+```
+
+**Split-mode caveat:** with `TOPIC_MODE=split PIPELINE_MODE=split`, point `emit` at the
+event type's topic instead — FEEDER → `scada.telemetry.feeder`, BREAKER →
+`scada.telemetry.breaker`, TRANSFORMER → `scada.telemetry.transformer`. The sag→trip test then
+exercises the cross-topic feeder∪breaker union.
+
 ## Services & Ports
 
 | Service | Port | Description |
