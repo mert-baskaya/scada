@@ -39,6 +39,14 @@ public class LoadGenerator {
     static final int THREADS = Integer.parseInt(env("THREADS", "6"));
     static final int DURATION_SECONDS = Integer.parseInt(env("DURATION_SECONDS", "0"));
     static final int PARTITIONS = Integer.parseInt(env("PARTITIONS", "16"));
+    static final String TOPIC_MODE = env("TOPIC_MODE", "single");
+    static final boolean SPLIT = "split".equalsIgnoreCase(TOPIC_MODE);
+    static final int PARTITIONS_TRANSFORMER = Integer.parseInt(env("PARTITIONS_TRANSFORMER",
+            String.valueOf(Math.max(2, PARTITIONS / 8))));
+    static final int PARTITIONS_FEEDER = Integer.parseInt(env("PARTITIONS_FEEDER",
+            String.valueOf(PARTITIONS / 2)));
+    static final int PARTITIONS_BREAKER = Integer.parseInt(env("PARTITIONS_BREAKER",
+            String.valueOf(PARTITIONS / 2)));
     static final String BOOTSTRAP = env("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092");
 
     static final LongAdder TOTAL_SENT = new LongAdder();
@@ -49,11 +57,17 @@ public class LoadGenerator {
         return (v == null || v.isBlank()) ? def : v;
     }
 
+    static String topicFor(Kind kind) {
+        if (!SPLIT) return TOPIC;
+        return TOPIC + "." + kind.name().toLowerCase();
+    }
+
     enum Kind { TRANSFORMER, FEEDER, BREAKER }
 
     static final class Component {
         final String id;
         final Kind kind;
+        final String topic;
         final String jsonPrefix;
         double voltage = NOMINAL_V;
         double current;
@@ -67,6 +81,7 @@ public class LoadGenerator {
         Component(String id, Kind kind, String substation, Random rnd) {
             this.id = id;
             this.kind = kind;
+            this.topic = topicFor(kind);
             this.current = 300.0 + rnd.nextDouble() * 150.0;
             this.oilTemp = 55.0 + rnd.nextDouble() * 15.0;
             this.jsonPrefix = "{\"componentId\":\"" + id + "\",\"componentType\":\"" + kind
@@ -106,6 +121,10 @@ public class LoadGenerator {
         System.out.printf("[loadgen] target=%d ev/s components=%d threads=%d partitions=%d duration=%s%n",
                 TARGET_EPS, NUM_COMPONENTS, THREADS, PARTITIONS,
                 DURATION_SECONDS == 0 ? "unbounded" : DURATION_SECONDS + "s");
+        System.out.printf("[loadgen] TOPIC_MODE=%s topics=[%s]%n",
+                TOPIC_MODE, SPLIT
+                        ? topicFor(Kind.TRANSFORMER) + ", " + topicFor(Kind.FEEDER) + ", " + topicFor(Kind.BREAKER)
+                        : TOPIC);
 
         ensureTopic();
 
@@ -146,31 +165,45 @@ public class LoadGenerator {
     }
 
     static void ensureTopic() throws ExecutionException, InterruptedException {
+        ensureTopics();
+    }
+
+    static void ensureTopics() throws ExecutionException, InterruptedException {
         Properties props = new Properties();
         props.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, BOOTSTRAP);
         try (Admin admin = Admin.create(props)) {
-            NewTopic topic = new NewTopic(TOPIC, PARTITIONS, (short) 1)
-                    // cap disk use: ~300MB/s ingress would fill the Docker VM disk in minutes
-                    .configs(Map.of(
-                            "retention.bytes", "536870912",
-                            "segment.bytes", "134217728",
-                            "retention.ms", "600000"));
-            try {
-                admin.createTopics(List.of(topic)).all().get();
-                System.out.printf("[loadgen] created topic %s with %d partitions%n", TOPIC, PARTITIONS);
-            } catch (ExecutionException e) {
-                if (!(e.getCause() instanceof TopicExistsException)) throw e;
-                TopicDescription desc = admin.describeTopics(List.of(TOPIC))
-                        .allTopicNames().get().get(TOPIC);
-                int existing = desc.partitions().size();
-                if (existing < PARTITIONS) {
-                    System.out.printf("[loadgen] WARNING: topic %s already exists with only %d partition(s); "
-                            + "Flink consumption will be capped. Delete it first:%n"
-                            + "  docker exec scada-kafka /opt/kafka/bin/kafka-topics.sh "
-                            + "--bootstrap-server localhost:9092 --delete --topic %s%n", TOPIC, existing, TOPIC);
-                } else {
-                    System.out.printf("[loadgen] topic %s exists with %d partitions%n", TOPIC, existing);
-                }
+            if (SPLIT) {
+                ensureSingleTopic(admin, topicFor(Kind.TRANSFORMER), PARTITIONS_TRANSFORMER);
+                ensureSingleTopic(admin, topicFor(Kind.FEEDER), PARTITIONS_FEEDER);
+                ensureSingleTopic(admin, topicFor(Kind.BREAKER), PARTITIONS_BREAKER);
+            } else {
+                ensureSingleTopic(admin, TOPIC, PARTITIONS);
+            }
+        }
+    }
+
+    static void ensureSingleTopic(Admin admin, String topicName, int partitions)
+            throws InterruptedException, ExecutionException {
+        NewTopic nt = new NewTopic(topicName, partitions, (short) 1)
+                .configs(Map.of(
+                        "retention.bytes", "536870912",
+                        "segment.bytes", "134217728",
+                        "retention.ms", "600000"));
+        try {
+            admin.createTopics(List.of(nt)).all().get();
+            System.out.printf("[loadgen] created topic %s with %d partitions%n", topicName, partitions);
+        } catch (ExecutionException e) {
+            if (!(e.getCause() instanceof TopicExistsException)) throw e;
+            TopicDescription desc = admin.describeTopics(List.of(topicName))
+                    .allTopicNames().get().get(topicName);
+            int existing = desc.partitions().size();
+            if (existing < partitions) {
+                System.out.printf("[loadgen] WARNING: topic %s already exists with only %d partition(s); "
+                        + "Flink consumption will be capped. Delete it first:%n"
+                        + "  docker exec scada-kafka /opt/kafka/bin/kafka-topics.sh "
+                        + "--bootstrap-server localhost:9092 --delete --topic %s%n", topicName, existing, topicName);
+            } else {
+                System.out.printf("[loadgen] topic %s exists with %d partitions%n", topicName, existing);
             }
         }
     }
@@ -222,7 +255,7 @@ public class LoadGenerator {
                         Component c = comps[idx];
                         idx = (idx + 1 == comps.length) ? 0 : idx + 1;
                         byte[] value = nextReading(c);
-                        producer.send(new ProducerRecord<>(TOPIC, c.id, value));
+                        producer.send(new ProducerRecord<>(c.topic, c.id, value));
                     }
                     sent += batch;
                     TOTAL_SENT.add(batch);

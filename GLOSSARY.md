@@ -49,7 +49,7 @@ where they help.
 | Source / Sink | The operator that reads from an external system (Kafka in) / writes to one (Kafka out) — the pipeline's input and output adapters. |
 | keyBy / shuffle | Partitioning the stream by a field (e.g. component ID) so all events for the same key land on the same operator instance — like consistent-hashing requests to the server that holds that user's session; the resulting network redistribution is called a shuffle. |
 | Keyed state | Per-key variables an operator persists between events (a counter per breaker, an accumulator per component) — server-side session storage that Flink snapshots and restores for you. |
-| Process function | The low-level "just give me every event and let me manage state and timers myself" API — the escape hatch used by our fast and hybrid modes. |
+| Process function | The low-level "just give me every event and let me manage state and timers myself" API — the escape hatch used by our fast, hybrid, and split modes. |
 | Side output | A second, differently-typed output stream from one operator (our detector emits aggregates as the main output and alerts as a side output). |
 | Window / Tumbling window | Grouping an infinite stream into finite buckets to aggregate (average, min, max); *tumbling* means fixed, non-overlapping 30-second buckets, like `GROUP BY floor(timestamp/30s)`. |
 | Event time vs processing time | Whether logic uses the timestamp *inside* the event (when the sensor measured it) or the wall clock when the machine happens to process it; event time gives correct results even when processing is delayed or replayed. |

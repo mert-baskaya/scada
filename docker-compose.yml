@@ -45,6 +45,8 @@ services:
       context: ./scada-simulator
       dockerfile: Dockerfile
     container_name: scada-simulator
+    environment:
+      TOPIC_MODE: ${TOPIC_MODE:-single}
     depends_on:
       kafka:
         condition: service_healthy
@@ -119,6 +121,7 @@ services:
       THREADS: "6"
       DURATION_SECONDS: "0"
       PARTITIONS: "16"
+      TOPIC_MODE: ${TOPIC_MODE:-single}
     depends_on:
       kafka:
         condition: service_healthy

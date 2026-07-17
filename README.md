@@ -104,7 +104,7 @@ CEP patterns use `AfterMatchSkipStrategy.skipPastLastEvent()` per pattern and re
 
 ## Pipeline Modes & Load Testing
 
-The Flink job runs in one of three modes, selected with the `PIPELINE_MODE` env var
+The Flink job runs in one of four modes, selected with the `PIPELINE_MODE` env var
 (see [LOAD-TEST.md](LOAD-TEST.md) for the measured numbers and the full story):
 
 | Mode | Detection | Sinks | Measured ceiling (single machine) |
@@ -112,6 +112,10 @@ The Flink job runs in one of three modes, selected with the `PIPELINE_MODE` env 
 | `cep` (default) | 4 CEP patterns on the full stream | exactly-once | ~150k ev/s, OOM-collapses at 200k+ |
 | `fast` | keyed process functions, one shuffle | at-least-once | 1M ev/s |
 | `hybrid` | same CEP patterns behind pre-filters (overcurrent restructured) | exactly-once | 1M ev/s, CEP ops ~0.3% busy |
+| `split` | hybrid's detection fed from per-type topics (`scada.telemetry.{transformer,feeder,breaker}`), three parallel sources | exactly-once | 1M ev/s, busiest op ~5% |
+
+`split` also changes the producers: set `TOPIC_MODE=split` on the simulator/load generator so
+they publish each device type to its own topic (the two flags must be set together).
 
 ```bash
 # run the job in hybrid mode
@@ -119,6 +123,9 @@ PIPELINE_MODE=hybrid docker compose up -d flink-jobmanager flink-taskmanager fli
 
 # blast 1M events/s from a 10,000-component fleet (profile keeps it out of normal runs)
 TARGET_EPS=1000000 docker compose --profile loadtest up -d load-generator
+
+# or the whole stack in split mode (per-type topics end to end)
+TOPIC_MODE=split PIPELINE_MODE=split docker compose --profile loadtest up -d --build
 
 # measure: produce rate, Flink throughput, consumer lag, operator busyness, checkpoints
 ./loadtest-report.sh 300 20

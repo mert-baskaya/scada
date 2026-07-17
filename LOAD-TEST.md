@@ -1,6 +1,6 @@
-# Load Test — 1M events/s Through Three Pipeline Modes
+# Load Test — 1M events/s Through Four Pipeline Modes
 
-Measured results from driving the SCADA pipeline at up to **1,000,000 events/s** (2026-07-16).
+Measured results from driving the SCADA pipeline at up to **1,000,000 events/s** (2026-07-16/17).
 All numbers below come from live runs of `./loadtest-report.sh` against the stack on a single
 machine (Apple M4 Max, 16 cores, Docker VM with 15.6 GB), not theoretical values.
 
@@ -13,11 +13,15 @@ machine (Apple M4 Max, 16 cores, Docker VM with 15.6 GB), not theoretical values
 | `cep` (default) | ~150k ev/s | 27/27 checkpoints, CEP ~53% busy | 200k+: CEP heap OOM → heartbeat timeout → restart loop |
 | `fast` | **1,000,000 ev/s** | 13 ms checkpoints, 1.4 MB state, source ~26% busy | not reached (generator ceiling) |
 | `hybrid` | **1,000,000 ev/s** | 39 ms checkpoints, 3 MB state, CEP ops ~0.3% busy | not reached (generator ceiling) |
+| `split` | **1,000,000 ev/s** | 23 ms checkpoints, 3 MB state, busiest operator ~5% | not reached (generator ceiling) |
 
 Same detection semantics, same output topics, selected per run:
 
 ```bash
 PIPELINE_MODE=hybrid docker compose up -d flink-jobmanager flink-taskmanager flink-taskmanager-2
+
+# split mode also changes what the producers do — set both flags together
+TOPIC_MODE=split PIPELINE_MODE=split docker compose --profile loadtest up -d --build
 ```
 
 ## 2. The Load Generator
@@ -35,7 +39,9 @@ dedicated Java producer (compose profile `loadtest`, normal `docker compose up` 
   256 KB batches, StringBuilder JSON (no Jackson), ISO timestamp cached per millisecond.
 - **Topic management**: creates `scada.telemetry` with 16 partitions and capped retention
   (512 MB/partition, 10 min) — at ~300 MB/s ingress an uncapped topic fills the Docker disk in
-  minutes.
+  minutes. With `TOPIC_MODE=split` it instead creates `scada.telemetry.{transformer,feeder,breaker}`
+  (2/8/8 partitions, matching the 5/50/45% fleet volume mix) and routes each component's readings
+  to its type's topic.
 
 ```bash
 TARGET_EPS=1000000 docker compose --profile loadtest up -d load-generator
@@ -43,7 +49,8 @@ TARGET_EPS=1000000 docker compose --profile loadtest up -d load-generator
 ```
 
 Config env vars: `TARGET_EPS` (1,000,000), `NUM_COMPONENTS` (10,000), `THREADS` (6),
-`DURATION_SECONDS` (0 = unbounded), `PARTITIONS` (16).
+`DURATION_SECONDS` (0 = unbounded), `PARTITIONS` (16), `TOPIC_MODE` (`single`; `split` for
+per-type topics, with `PARTITIONS_TRANSFORMER/FEEDER/BREAKER` overrides).
 
 The generator held its target within ±0.05% in every run (e.g. `rate=1,000,022 ev/s`), so the
 produce side is never the variable being measured.
@@ -53,12 +60,16 @@ produce side is never the variable being measured.
 `loadtest-report.sh <duration> <interval>` samples:
 
 - **Produce rate** — the generator's own 5 s counters (measured, not assumed).
-- **Flink throughput** — REST API `numRecordsOutPerSecond` on the source vertex.
-- **Consumer lag** — `kafka-consumer-groups.sh` for group `flink-scada-processor`. Two caveats:
-  the group only exists after the first successful checkpoint (offsets commit on checkpoint),
+- **Flink throughput** — committed-offset growth summed across all `flink-scada-*` consumer
+  groups (auto-detected; split mode has three). Earlier versions read `numRecordsOutPerSecond`
+  on the source vertex, but that counts a record once per outgoing chained edge — with filters
+  chained to the source it reported ~1.95M "ev/s" at a true 1M ingest.
+- **Consumer lag** — `kafka-consumer-groups.sh`, lag summed across the same groups. Two caveats:
+  a group only exists after the first successful checkpoint (offsets commit on checkpoint),
   and committed offsets trail true consumption by up to one checkpoint interval — at 1M ev/s
-  that is ~10M events of apparent "lag" that is pure commit cadence. Trust the source rate and
-  the lag *sawtooth minimum*, not raw lag deltas.
+  that is ~10M events of apparent "lag" that is pure commit cadence. The per-sample throughput
+  column also quantizes (a 20 s sample spans 2 or 3 of the 10 s commits, so it alternates
+  ~0.9M/1.36M); trust the summary averages and the lag *sawtooth minimum*, not raw deltas.
 - **Operator busyness** — `busyTimeMsPerSecond` per vertex (1000 ms/s = saturated subtask).
 - **Checkpoint health** — completed/failed counts, duration, state size.
 
@@ -150,7 +161,44 @@ The same CEP operators that crashed the job at 200k ev/s are ~0.3% busy at 5× t
 Alert mix over a 300-alert sample: 207 flapping, 59 overcurrent, 18 sag-trip, 16 overheat —
 all four types flowing through the unchanged patterns.
 
-## 7. What This Means Off a Laptop
+## 7. Split Mode: Per-Type Topics, Parallel Pipelines
+
+`PIPELINE_MODE=split` + `TOPIC_MODE=split` (the flags must be set together — a split job on
+single-topic producers consumes nothing, and vice versa) move the event-type routing out of
+Flink and into Kafka. Producers write each device type to its own topic; the job runs three
+KafkaSources (consumer groups `flink-scada-split-{transformer,feeder,breaker}`, each with its
+own watermarks) and feeds every detection branch only the type(s) it can match:
+
+| Branch | Consumes | Operator |
+|---|---|---|
+| Windowed aggregation | all three topics (union) | unchanged `TumblingEventTimeWindows` |
+| OVERHEAT_CEP | `scada.telemetry.transformer` | unchanged pattern behind `PreFilters` |
+| FLAPPING_CEP | `scada.telemetry.breaker` | unchanged pattern behind status-change filter |
+| OVERCURRENT_DETECTOR | `scada.telemetry.feeder` | hybrid's keyed detector, pre-filter dropped |
+| SAG_TRIP_CEP | feeder ∪ breaker (cross-type!) | unchanged pattern, keyed by substationId |
+
+Everything else is hybrid's code reused verbatim — patterns, filters, exactly-once sinks. The
+sag→trip branch is why the split can't be total: it correlates a FEEDER sag with a BREAKER trip,
+so those two topics union for that branch (union takes the min watermark; the 30 s idleness
+setting covers a quiet topic).
+
+**Measured at 1M ev/s** (5-minute window, 2026-07-17): consumption averaged 1,013,993 ev/s
+(produce rate plus backlog drain, net lag −14.5k ev/s), **36/36 checkpoints at 23 ms**, 3.0 MB
+state, busiest visible operator (SAG_TRIP_FILTER) at ~5%.
+
+**Honest comparison**: at 1M ev/s split ≈ hybrid — both are mostly idle, because hybrid's
+pre-filters already solved CEP fan-out inside the job. What split changes is *where* work
+happens: the broker routes by type, so no branch deserializes events it will discard, and each
+type's consumption scales independently (partitions and parallelism per topic). The difference
+would show past hybrid's saturation point, or against `cep` mode's ~150k ceiling.
+
+Two operational gotchas, both hit in practice: compose caches images, so `--build` is required
+or the load generator silently keeps publishing to the single topic while the env says split;
+and the low-rate Python simulator can auto-create `scada.telemetry.transformer` with 1 partition
+if it starts before the load generator creates it properly (fix: `kafka-topics.sh --alter`, or
+pre-create).
+
+## 8. What This Means Off a Laptop
 
 - **CEP scales horizontally** (it is keyed), but brute-forcing 1M ev/s through unfiltered CEP
   costs roughly 10× the hardware of the hybrid shape — and RocksDB, the usual OOM fix, trades
@@ -162,11 +210,13 @@ all four types flowing through the unchanged patterns.
 - **Watermark tightness is the second lever**: CEP buffer ∝ rate × out-of-orderness. The demo
   allows 5 s; a well-behaved transport justifies 500 ms–1 s.
 - **Count your shuffles**: cep mode moves the full stream 5×, hybrid ~1.45× (aggregation +
-  feeder stream), fast 2×. On a cluster this is real network, not just CPU.
+  feeder stream), fast 2×, split ~1.5× (but the broker has already fanned the ingest into
+  per-type topics, so each shuffle moves only that type). On a cluster this is real network,
+  not just CPU.
 - **Watch key skew**: `keyBy(substationId)` caps that pattern's parallelism at the substation
   count — fine at 500, a hotspot at 10.
 
-## 8. Infrastructure Deltas for the Load Tests
+## 9. Infrastructure Deltas for the Load Tests
 
 Changes that stay in `docker-compose.yml` (they don't affect the low-rate demo, but note the
 last one):

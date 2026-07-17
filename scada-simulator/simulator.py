@@ -1,4 +1,5 @@
 import json
+import os
 import random
 import time
 from datetime import datetime, timezone
@@ -9,6 +10,21 @@ from kafka.errors import NoBrokersAvailable
 NOMINAL_VOLTAGE = {"SUB-A": 34.5, "SUB-B": 13.8}
 RATED_CURRENT = 400.0
 NOMINAL_FREQ = 60.0
+
+TOPIC_MODE = os.getenv("TOPIC_MODE", "single")
+BASE_TOPIC = "scada.telemetry"
+if TOPIC_MODE == "split":
+    TOPIC_BY_TYPE = {
+        "TRANSFORMER": BASE_TOPIC + ".transformer",
+        "FEEDER": BASE_TOPIC + ".feeder",
+        "BREAKER": BASE_TOPIC + ".breaker",
+    }
+else:
+    TOPIC_BY_TYPE = {
+        "TRANSFORMER": BASE_TOPIC,
+        "FEEDER": BASE_TOPIC,
+        "BREAKER": BASE_TOPIC,
+    }
 
 COMPONENTS = [
     {"id": "SUB-A-XFMR-1",  "type": "TRANSFORMER", "substation": "SUB-A", "nominalV": 34.5},
@@ -211,6 +227,8 @@ def run():
     bootstrap = "kafka:9092"
     producer = wait_for_kafka(bootstrap)
 
+    print(f"[scada-sim] TOPIC_MODE={TOPIC_MODE} topics={set(TOPIC_BY_TYPE.values())}")
+
     state = {k: dict(v) for k, v in INITIAL_STATE.items()}
     idx = 0
     # ticks are 0.1s, so 450-900 ticks = 45-90s between scenarios
@@ -236,7 +254,7 @@ def run():
                     next_scenario_tick = idx + random.randint(450, 900)
 
             reading = generate_reading(comp, state, idx)
-            producer.send("scada.telemetry", key=cid, value=reading)
+            producer.send(TOPIC_BY_TYPE[comp["type"]], key=cid, value=reading)
             idx += 1
             time.sleep(0.1)
     except KeyboardInterrupt:

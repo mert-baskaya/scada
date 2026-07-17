@@ -65,7 +65,7 @@ One job, five logical branches off a shared source. Suggested visual: a job-grap
 
 | Aspect | Value |
 |---|---|
-| Source | KafkaSource, topic `scada.telemetry`, group `flink-scada-processor` |
+| Source | KafkaSource, topic `scada.telemetry`, group `flink-scada-processor` (in `PIPELINE_MODE=split` + `TOPIC_MODE=split`: three sources on `scada.telemetry.{transformer,feeder,breaker}`, groups `flink-scada-split-*` — see LOAD-TEST.md §7) |
 | Start position | committed offsets, fallback `latest` (survives fresh job submission) |
 | Watermarks | bounded out-of-orderness **5 s**, idleness **30 s** |
 | Time semantics | event time (from the telemetry `timestamp` field) |
