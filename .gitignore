@@ -1,6 +1,7 @@
 # Build output
 flink-job/target/
 spring-api/target/
+load-generator/target/
 flink-job/dependency-reduced-pom.xml
 __pycache__/
 *.pyc
